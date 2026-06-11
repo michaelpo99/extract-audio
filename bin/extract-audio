@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+usage() {
+    cat <<'EOF'
+用法：
+  extract-audio [目錄]
+  extract-audio --force [目錄]
+
+說明：
+  掃描指定目錄中的影片，抽取第一條音軌。
+  未指定目錄時，處理目前目錄。
+  輸出放在目標目錄下的 audio/ 子目錄。
+
+選項：
+  -f, --force   覆蓋已存在的輸出檔
+  -h, --help    顯示說明
+
+範例：
+  extract-audio
+  extract-audio /mnt/d/Videos
+  extract-audio --force
+EOF
+}
+
+force=0
+target_dir="."
+positional_count=0
+
+while (($# > 0)); do
+    case "$1" in
+        -f|--force)
+            force=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            echo "錯誤：未知選項：$1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            positional_count=$((positional_count + 1))
+            if (( positional_count > 1 )); then
+                echo "錯誤：只能指定一個目錄。" >&2
+                exit 2
+            fi
+            target_dir="$1"
+            ;;
+    esac
+    shift
+done
+
+for command_name in ffmpeg ffprobe find; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "錯誤：找不到 $command_name" >&2
+        echo "請先安裝 FFmpeg，例如：sudo apt install -y ffmpeg" >&2
+        exit 1
+    fi
+done
+
+if [[ ! -d "$target_dir" ]]; then
+    echo "錯誤：目錄不存在：$target_dir" >&2
+    exit 1
+fi
+
+output_dir="$target_dir/audio"
+mkdir -p "$output_dir"
+
+validate_audio() {
+    local file="$1"
+
+    [[ -s "$file" ]] &&
+        ffprobe \
+            -v error \
+            -select_streams a:0 \
+            -show_entries stream=codec_name \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$file" 2>/dev/null |
+        grep -q .
+}
+
+choose_extension() {
+    local codec="$1"
+
+    case "$codec" in
+        aac|alac)
+            echo "m4a"
+            ;;
+        mp3)
+            echo "mp3"
+            ;;
+        flac)
+            echo "flac"
+            ;;
+        opus)
+            echo "opus"
+            ;;
+        vorbis)
+            echo "ogg"
+            ;;
+        ac3)
+            echo "ac3"
+            ;;
+        eac3)
+            echo "eac3"
+            ;;
+        pcm_*)
+            echo "wav"
+            ;;
+        *)
+            echo "mka"
+            ;;
+    esac
+}
+
+total=0
+copied=0
+converted=0
+skipped=0
+no_audio=0
+failed=0
+
+echo "來源目錄：$target_dir"
+echo "輸出目錄：$output_dir"
+echo
+
+while IFS= read -r -d '' input_file; do
+    total=$((total + 1))
+
+    filename="${input_file##*/}"
+    stem="${filename%.*}"
+
+    codec="$(
+        ffprobe \
+            -v error \
+            -select_streams a:0 \
+            -show_entries stream=codec_name \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$input_file" 2>/dev/null |
+        head -n 1
+    )"
+
+    if [[ -z "$codec" ]]; then
+        echo "[無音軌] $filename"
+        no_audio=$((no_audio + 1))
+        continue
+    fi
+
+    audio_count="$(
+        ffprobe \
+            -v error \
+            -select_streams a \
+            -show_entries stream=index \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$input_file" 2>/dev/null |
+        sed '/^[[:space:]]*$/d' |
+        wc -l |
+        tr -d '[:space:]'
+    )"
+
+    if [[ "${audio_count:-0}" -gt 1 ]]; then
+        echo "[注意] $filename 有 $audio_count 條音軌，本次只處理第一條。"
+    fi
+
+    extension="$(choose_extension "$codec")"
+    output_file="$output_dir/$stem.$extension"
+
+    if [[ -s "$output_file" && "$force" -eq 0 ]]; then
+        echo "[跳過] $filename → 已存在：${output_file##*/}"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    if [[ "$force" -eq 1 ]]; then
+        rm -f -- "$output_file"
+    fi
+
+    temp_file="$output_dir/.${stem}.part.${extension}"
+    rm -f -- "$temp_file"
+
+    echo "[抽取] $filename"
+    echo "       codec=$codec → ${output_file##*/}"
+
+    if ffmpeg \
+        -hide_banner \
+        -loglevel error \
+        -nostdin \
+        -y \
+        -i "$input_file" \
+        -map 0:a:0 \
+        -vn \
+        -sn \
+        -dn \
+        -c:a copy \
+        "$temp_file" &&
+        validate_audio "$temp_file"; then
+
+        mv -f -- "$temp_file" "$output_file"
+        touch -r "$input_file" "$output_file" 2>/dev/null || true
+
+        echo "[完成] 直接抽取：${output_file##*/}"
+        copied=$((copied + 1))
+        continue
+    fi
+
+    rm -f -- "$temp_file"
+
+    fallback_file="$output_dir/$stem.flac"
+
+    if [[ -s "$fallback_file" && "$force" -eq 0 ]]; then
+        echo "[跳過] 直接抽取失敗，但 FLAC 已存在：${fallback_file##*/}"
+        skipped=$((skipped + 1))
+        continue
+    fi
+
+    if [[ "$force" -eq 1 ]]; then
+        rm -f -- "$fallback_file"
+    fi
+
+    fallback_temp="$output_dir/.${stem}.part.flac"
+    rm -f -- "$fallback_temp"
+
+    echo "[轉換] 無法直接抽取，改轉無損 FLAC。"
+
+    if ffmpeg \
+        -hide_banner \
+        -loglevel error \
+        -nostdin \
+        -y \
+        -i "$input_file" \
+        -map 0:a:0 \
+        -vn \
+        -sn \
+        -dn \
+        -c:a flac \
+        -compression_level 5 \
+        "$fallback_temp" &&
+        validate_audio "$fallback_temp"; then
+
+        mv -f -- "$fallback_temp" "$fallback_file"
+        touch -r "$input_file" "$fallback_file" 2>/dev/null || true
+
+        echo "[完成] 轉成 FLAC：${fallback_file##*/}"
+        converted=$((converted + 1))
+    else
+        rm -f -- "$fallback_temp"
+        echo "[失敗] $filename" >&2
+        failed=$((failed + 1))
+    fi
+done < <(
+    find "$target_dir" \
+        -maxdepth 1 \
+        -type f \
+        \( \
+            -iname '*.mp4'  -o \
+            -iname '*.m4v'  -o \
+            -iname '*.mkv'  -o \
+            -iname '*.mov'  -o \
+            -iname '*.avi'  -o \
+            -iname '*.webm' -o \
+            -iname '*.wmv'  -o \
+            -iname '*.flv'  -o \
+            -iname '*.ts'   -o \
+            -iname '*.mts'  -o \
+            -iname '*.m2ts' -o \
+            -iname '*.mpg'  -o \
+            -iname '*.mpeg' -o \
+            -iname '*.3gp'  -o \
+            -iname '*.ogv'  -o \
+            -iname '*.vob'  -o \
+            -iname '*.mxf' \
+        \) \
+        -print0 |
+    sort -z
+)
+
+echo
+echo "處理完成"
+echo "--------------------------------"
+echo "找到影片：       $total"
+echo "直接抽取：       $copied"
+echo "轉成 FLAC：      $converted"
+echo "已存在而跳過：   $skipped"
+echo "沒有音軌：       $no_audio"
+echo "處理失敗：       $failed"
+
+if (( total == 0 )); then
+    echo
+    echo "目前目錄沒有找到支援的影片檔。"
+fi
+
+if (( failed > 0 )); then
+    exit 1
+fi
