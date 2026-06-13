@@ -295,8 +295,16 @@ if [[ "$effective_device" == "cuda" && "$cuda_available" != "True" ]]; then
     exit 1
 fi
 
+# Prefer the proven large-v3 profile on this machine's RTX 3050 6GB.
+prefer_rtx3050_large_v3=0
+if [[ "$effective_device" == "cuda" && "$gpu_name" == *"RTX 3050"* ]] && (( vram_mb >= 6000 )); then
+    prefer_rtx3050_large_v3=1
+fi
+
 if [[ -z "$effective_model" ]]; then
-    if [[ "$effective_device" == "cuda" ]]; then
+    if (( prefer_rtx3050_large_v3 == 1 )); then
+        effective_model="large-v3"
+    elif [[ "$effective_device" == "cuda" ]]; then
         if (( vram_mb >= 10000 )); then
             effective_model="large-v3"
         elif (( vram_mb >= 6144 )); then
@@ -312,7 +320,9 @@ if [[ -z "$effective_model" ]]; then
 fi
 
 if [[ -z "$effective_compute_type" ]]; then
-    if [[ "$effective_device" == "cuda" ]]; then
+    if (( prefer_rtx3050_large_v3 == 1 )); then
+        effective_compute_type="float16"
+    elif [[ "$effective_device" == "cuda" ]]; then
         if (( vram_mb >= 4096 )); then
             effective_compute_type="float16"
         else
@@ -324,7 +334,9 @@ if [[ -z "$effective_compute_type" ]]; then
 fi
 
 if [[ -z "$effective_batch_size" ]]; then
-    if [[ "$effective_device" == "cuda" ]]; then
+    if (( prefer_rtx3050_large_v3 == 1 )); then
+        effective_batch_size="2"
+    elif [[ "$effective_device" == "cuda" ]]; then
         if (( vram_mb >= 10000 )); then
             effective_batch_size="8"
         elif (( vram_mb >= 6144 )); then
