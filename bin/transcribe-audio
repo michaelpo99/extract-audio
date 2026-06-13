@@ -162,7 +162,7 @@ if [[ ! -d "$target_dir" ]]; then
     exit 1
 fi
 
-for command_name in bash ffmpeg ffprobe find sort; do
+for command_name in bash ffmpeg ffprobe find sort awk stat; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
         echo "錯誤：找不到 $command_name" >&2
         exit 1
@@ -458,6 +458,80 @@ detect_audio_codec() {
     head -n 1
 }
 
+detect_media_duration_ms() {
+    local file="$1"
+    local raw_duration
+
+    raw_duration="$(
+        ffprobe \
+            -v error \
+            -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$file" 2>/dev/null |
+        head -n 1
+    )"
+
+    if [[ -z "$raw_duration" ]]; then
+        echo "0"
+        return 0
+    fi
+
+    awk -v duration="$raw_duration" 'BEGIN {
+        if (duration + 0 <= 0) {
+            print 0
+        } else {
+            printf "%.0f\n", duration * 1000
+        }
+    }'
+}
+
+detect_file_size_bytes() {
+    local file="$1"
+
+    stat -c %s "$file" 2>/dev/null || echo "0"
+}
+
+format_duration_human() {
+    local total_ms="${1:-0}"
+    local total_seconds hours minutes seconds
+
+    if [[ -z "$total_ms" || "$total_ms" -lt 0 ]]; then
+        total_ms=0
+    fi
+
+    total_seconds=$((total_ms / 1000))
+    hours=$((total_seconds / 3600))
+    minutes=$(((total_seconds % 3600) / 60))
+    seconds=$((total_seconds % 60))
+
+    printf "%02d:%02d:%02d\n" "$hours" "$minutes" "$seconds"
+}
+
+format_seconds_from_ms() {
+    local total_ms="${1:-0}"
+
+    awk -v value="$total_ms" 'BEGIN { printf "%.3f\n", value / 1000 }'
+}
+
+format_mb_from_bytes() {
+    local total_bytes="${1:-0}"
+
+    awk -v value="$total_bytes" 'BEGIN { printf "%.2f\n", value / 1048576 }'
+}
+
+format_ratio() {
+    local numerator="${1:-0}"
+    local denominator="${2:-0}"
+
+    awk -v n="$numerator" -v d="$denominator" 'BEGIN {
+        if (d <= 0) {
+            print "0.000"
+        } else {
+            printf "%.3f\n", n / d
+        }
+    }'
+}
+
 primary_output_extension() {
     case "$output_format" in
         all)
@@ -531,6 +605,8 @@ done < "$audio_scan_file"
 
 declare -a transcription_queue=()
 declare -a failed_items=()
+declare -A queued_media_duration_ms=()
+declare -A queued_media_size_bytes=()
 
 audio_found=0
 video_found=0
@@ -542,6 +618,12 @@ transcribe_success=0
 transcribe_failed=0
 transcribe_skipped=0
 transcript_stem_conflicts=0
+queue_total_duration_ms=0
+queue_total_size_bytes=0
+attempted_duration_ms=0
+attempted_size_bytes=0
+skipped_duration_ms=0
+skipped_size_bytes=0
 
 enqueue_audio_for_transcription() {
     local audio_path="$1"
@@ -737,6 +819,16 @@ if (( ${#transcription_queue[@]} == 0 )); then
     exit 0
 fi
 
+for queued_file in "${transcription_queue[@]}"; do
+    queued_media_duration_ms["$queued_file"]="$(detect_media_duration_ms "$queued_file")"
+    queued_media_size_bytes["$queued_file"]="$(detect_file_size_bytes "$queued_file")"
+    queue_total_duration_ms=$((queue_total_duration_ms + queued_media_duration_ms["$queued_file"]))
+    queue_total_size_bytes=$((queue_total_size_bytes + queued_media_size_bytes["$queued_file"]))
+done
+
+run_started_epoch="$(date +%s)"
+run_started_at="$(date '+%F %T %z')"
+
 primary_ext="$(primary_output_extension)"
 summary_file="$transcript_dir/_run-summary.txt"
 env_file="$transcript_dir/_environment.txt"
@@ -766,10 +858,14 @@ fi
 for input_file in "${transcription_queue[@]}"; do
     stem="$(basename "${input_file%.*}")"
     primary_output="$transcript_dir/$stem.$primary_ext"
+    file_duration_ms="${queued_media_duration_ms[$input_file]:-0}"
+    file_size_bytes="${queued_media_size_bytes[$input_file]:-0}"
 
     if [[ -s "$primary_output" && "$force" -eq 0 ]]; then
         echo "[跳過] ${input_file##*/} → 已存在：${primary_output##*/}"
         transcribe_skipped=$((transcribe_skipped + 1))
+        skipped_duration_ms=$((skipped_duration_ms + file_duration_ms))
+        skipped_size_bytes=$((skipped_size_bytes + file_size_bytes))
         continue
     fi
 
@@ -815,6 +911,9 @@ for input_file in "${transcription_queue[@]}"; do
         printf '\n'
     fi
 
+    attempted_duration_ms=$((attempted_duration_ms + file_duration_ms))
+    attempted_size_bytes=$((attempted_size_bytes + file_size_bytes))
+
     if "${cmd[@]}"; then
         if [[ -s "$primary_output" ]]; then
             echo "[完成] ${primary_output##*/}"
@@ -835,9 +934,37 @@ for item in "${failed_items[@]}"; do
     echo -e "$item" >> "$failed_file"
 done
 
+run_finished_epoch="$(date +%s)"
+run_finished_at="$(date '+%F %T %z')"
+run_duration_ms=$(((run_finished_epoch - run_started_epoch) * 1000))
+transcribe_attempted=$((transcribe_success + transcribe_failed))
+transcribe_processed=$((transcribe_attempted + transcribe_skipped))
+avg_runtime_per_attempt_ms=0
+
+if (( transcribe_attempted > 0 )); then
+    avg_runtime_per_attempt_ms=$((run_duration_ms / transcribe_attempted))
+fi
+
+queue_total_duration_sec="$(format_seconds_from_ms "$queue_total_duration_ms")"
+queue_total_duration_human="$(format_duration_human "$queue_total_duration_ms")"
+queue_total_size_mb="$(format_mb_from_bytes "$queue_total_size_bytes")"
+attempted_duration_sec="$(format_seconds_from_ms "$attempted_duration_ms")"
+attempted_duration_human="$(format_duration_human "$attempted_duration_ms")"
+attempted_size_mb="$(format_mb_from_bytes "$attempted_size_bytes")"
+run_duration_sec="$(format_seconds_from_ms "$run_duration_ms")"
+run_duration_human="$(format_duration_human "$run_duration_ms")"
+avg_runtime_per_attempt_sec="$(format_seconds_from_ms "$avg_runtime_per_attempt_ms")"
+success_rate="$(format_ratio "$transcribe_success" "$transcribe_attempted")"
+realtime_factor="$(format_ratio "$run_duration_ms" "$attempted_duration_ms")"
+processing_speed_x="$(format_ratio "$attempted_duration_ms" "$run_duration_ms")"
+
 {
     echo "source_dir=$target_dir"
     echo "transcript_dir=$transcript_dir"
+    echo "run_started_at=$run_started_at"
+    echo "run_finished_at=$run_finished_at"
+    echo "run_duration_sec=$run_duration_sec"
+    echo "run_duration_human=$run_duration_human"
     echo "audio_found=$audio_found"
     echo "video_found=$video_found"
     echo "audio_extracted=$audio_extracted"
@@ -846,9 +973,23 @@ done
     echo "audio_extract_failed=$audio_extract_failed"
     echo "transcript_stem_conflicts=$transcript_stem_conflicts"
     echo "transcribe_queue=${#transcription_queue[@]}"
+    echo "queue_total_duration_sec=$queue_total_duration_sec"
+    echo "queue_total_duration_human=$queue_total_duration_human"
+    echo "queue_total_size_bytes=$queue_total_size_bytes"
+    echo "queue_total_size_mb=$queue_total_size_mb"
+    echo "transcribe_attempted=$transcribe_attempted"
+    echo "transcribe_processed=$transcribe_processed"
     echo "transcribe_success=$transcribe_success"
     echo "transcribe_failed=$transcribe_failed"
     echo "transcribe_skipped=$transcribe_skipped"
+    echo "attempted_duration_sec=$attempted_duration_sec"
+    echo "attempted_duration_human=$attempted_duration_human"
+    echo "attempted_size_bytes=$attempted_size_bytes"
+    echo "attempted_size_mb=$attempted_size_mb"
+    echo "avg_runtime_per_attempt_sec=$avg_runtime_per_attempt_sec"
+    echo "success_rate=$success_rate"
+    echo "realtime_factor=$realtime_factor"
+    echo "processing_speed_x=$processing_speed_x"
     echo "device=$effective_device"
     echo "model=$effective_model"
     echo "compute_type=$effective_compute_type"
