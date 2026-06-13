@@ -1,0 +1,868 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+usage() {
+    cat <<'EOF'
+用法：
+  transcribe-audio [目錄]
+  transcribe-audio --diarize [目錄]
+  transcribe-audio --force [目錄]
+  transcribe-audio --check [目錄]
+
+說明：
+  掃描指定目錄第一層的音檔與影片檔。
+  若遇到影片檔，先抽出第一條音軌到相同目錄，再使用 WhisperX 轉成文字。
+  輸出放在目標目錄下的 transcript/ 子目錄。
+
+選項：
+  -d, --diarize                 啟用說話者分離
+  -f, --force                   覆蓋既有音檔與逐字稿輸出
+      --check                   只檢查環境與推估參數，不執行轉錄
+      --model NAME              指定模型，例如：small、medium、large-v3
+      --device auto|cuda|cpu    指定裝置，預設 auto
+      --batch-size N            指定 batch size
+      --compute-type TYPE       指定 compute type：default|float16|float32|int8
+      --language CODE           指定語言，預設 zh
+      --output-format FORMAT    指定輸出格式，預設 txt
+      --min-speakers N          diarize 時設定最小講者數
+      --max-speakers N          diarize 時設定最大講者數
+      --verbose                 顯示詳細資訊
+  -h, --help                    顯示說明
+
+範例：
+  transcribe-audio
+  transcribe-audio --check
+  transcribe-audio --force "/mnt/d/Videos/Meeting"
+  transcribe-audio --diarize --min-speakers 2 --max-speakers 6
+EOF
+}
+
+force=0
+check_only=0
+diarize=0
+verbose=0
+target_dir="."
+device_preference="auto"
+language="zh"
+output_format="txt"
+model=""
+batch_size=""
+compute_type=""
+min_speakers=""
+max_speakers=""
+positional_count=0
+
+while (($# > 0)); do
+    case "$1" in
+        -d|--diarize)
+            diarize=1
+            ;;
+        -f|--force)
+            force=1
+            ;;
+        --check)
+            check_only=1
+            ;;
+        --model)
+            shift
+            [[ $# -gt 0 ]] || { echo "錯誤：--model 需要值。" >&2; exit 2; }
+            model="$1"
+            ;;
+        --device)
+            shift
+            [[ $# -gt 0 ]] || { echo "錯誤：--device 需要值。" >&2; exit 2; }
+            device_preference="$1"
+            ;;
+        --batch-size)
+            shift
+            [[ $# -gt 0 ]] || { echo "錯誤：--batch-size 需要值。" >&2; exit 2; }
+            batch_size="$1"
+            ;;
+        --compute-type)
+            shift
+            [[ $# -gt 0 ]] || { echo "錯誤：--compute-type 需要值。" >&2; exit 2; }
+            compute_type="$1"
+            ;;
+        --language)
+            shift
+            [[ $# -gt 0 ]] || { echo "錯誤：--language 需要值。" >&2; exit 2; }
+            language="$1"
+            ;;
+        --output-format)
+            shift
+            [[ $# -gt 0 ]] || { echo "錯誤：--output-format 需要值。" >&2; exit 2; }
+            output_format="$1"
+            ;;
+        --min-speakers)
+            shift
+            [[ $# -gt 0 ]] || { echo "錯誤：--min-speakers 需要值。" >&2; exit 2; }
+            min_speakers="$1"
+            ;;
+        --max-speakers)
+            shift
+            [[ $# -gt 0 ]] || { echo "錯誤：--max-speakers 需要值。" >&2; exit 2; }
+            max_speakers="$1"
+            ;;
+        --verbose)
+            verbose=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            echo "錯誤：未知選項：$1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            positional_count=$((positional_count + 1))
+            if (( positional_count > 1 )); then
+                echo "錯誤：只能指定一個目錄。" >&2
+                exit 2
+            fi
+            target_dir="$1"
+            ;;
+    esac
+    shift
+done
+
+case "$device_preference" in
+    auto|cuda|cpu) ;;
+    *)
+        echo "錯誤：--device 只接受 auto、cuda、cpu。" >&2
+        exit 2
+        ;;
+esac
+
+case "$output_format" in
+    all|txt|json|srt|vtt|tsv|aud) ;;
+    *)
+        echo "錯誤：--output-format 只接受 all、txt、json、srt、vtt、tsv、aud。" >&2
+        exit 2
+        ;;
+esac
+
+case "$compute_type" in
+    ""|default|float16|float32|int8) ;;
+    *)
+        echo "錯誤：--compute-type 只接受 default、float16、float32、int8。" >&2
+        exit 2
+        ;;
+esac
+
+if [[ -n "$min_speakers" || -n "$max_speakers" ]] && (( diarize == 0 )); then
+    echo "錯誤：--min-speakers / --max-speakers 只能搭配 --diarize。" >&2
+    exit 2
+fi
+
+if [[ ! -d "$target_dir" ]]; then
+    echo "錯誤：目錄不存在：$target_dir" >&2
+    exit 1
+fi
+
+for command_name in bash ffmpeg ffprobe find sort; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "錯誤：找不到 $command_name" >&2
+        exit 1
+    fi
+done
+
+WHISPERX_BIN=""
+if command -v whisperx >/dev/null 2>&1; then
+    WHISPERX_BIN="$(command -v whisperx)"
+elif [[ -x "$HOME/.venvs/whisperx/bin/whisperx" ]]; then
+    WHISPERX_BIN="$HOME/.venvs/whisperx/bin/whisperx"
+else
+    echo "錯誤：找不到 whisperx。" >&2
+    echo "請先安裝並確認 PATH，或使用 $HOME/.venvs/whisperx/bin/whisperx。" >&2
+    exit 1
+fi
+
+PYTHON_BIN=""
+candidate_python="$(dirname "$WHISPERX_BIN")/python"
+if [[ -x "$candidate_python" ]]; then
+    PYTHON_BIN="$candidate_python"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python)"
+else
+    echo "錯誤：找不到 Python。" >&2
+    exit 1
+fi
+
+detect_runtime_info() {
+    "$PYTHON_BIN" - <<'PY'
+import json
+import os
+import platform
+import sys
+
+result = {
+    "python_version": platform.python_version(),
+    "whisperx_version": "",
+    "torch_version": "",
+    "cuda_available": "False",
+    "cuda_runtime": "",
+    "gpu_name": "",
+    "vram_mb": "0",
+    "import_error": "",
+}
+
+try:
+    import whisperx  # type: ignore
+    version = getattr(whisperx, "__version__", "")
+    if not version:
+        try:
+            from importlib.metadata import version as pkg_version
+            version = pkg_version("whisperx")
+        except Exception:
+            version = ""
+    result["whisperx_version"] = version
+except Exception as exc:
+    result["import_error"] = f"whisperx import failed: {exc}"
+
+try:
+    import torch  # type: ignore
+    result["torch_version"] = getattr(torch, "__version__", "")
+    result["cuda_available"] = str(bool(torch.cuda.is_available()))
+    result["cuda_runtime"] = str(getattr(torch.version, "cuda", "") or "")
+    if torch.cuda.is_available():
+        result["gpu_name"] = str(torch.cuda.get_device_name(0))
+        props = torch.cuda.get_device_properties(0)
+        result["vram_mb"] = str(int(props.total_memory // (1024 * 1024)))
+except Exception as exc:
+    if result["import_error"]:
+        result["import_error"] += "; "
+    result["import_error"] += f"torch import failed: {exc}"
+
+for key, value in result.items():
+    print(f"{key}={value}")
+PY
+}
+
+runtime_info="$(detect_runtime_info)"
+
+python_version=""
+whisperx_version=""
+torch_version=""
+cuda_available="False"
+cuda_runtime=""
+gpu_name=""
+vram_mb="0"
+import_error=""
+
+while IFS='=' read -r key value; do
+    case "$key" in
+        python_version) python_version="$value" ;;
+        whisperx_version) whisperx_version="$value" ;;
+        torch_version) torch_version="$value" ;;
+        cuda_available) cuda_available="$value" ;;
+        cuda_runtime) cuda_runtime="$value" ;;
+        gpu_name) gpu_name="$value" ;;
+        vram_mb) vram_mb="$value" ;;
+        import_error) import_error="$value" ;;
+    esac
+done <<< "$runtime_info"
+
+if [[ -n "$import_error" ]]; then
+    echo "錯誤：WhisperX 執行環境異常：$import_error" >&2
+    exit 1
+fi
+
+if ! "$WHISPERX_BIN" --help >/dev/null 2>&1; then
+    echo "錯誤：whisperx --help 執行失敗。" >&2
+    exit 1
+fi
+
+effective_device="$device_preference"
+effective_model="$model"
+effective_batch_size="$batch_size"
+effective_compute_type="$compute_type"
+
+if [[ "$effective_device" == "auto" ]]; then
+    if [[ "$cuda_available" == "True" ]]; then
+        effective_device="cuda"
+    else
+        effective_device="cpu"
+    fi
+fi
+
+if [[ "$effective_device" == "cuda" && "$cuda_available" != "True" ]]; then
+    echo "錯誤：指定 --device cuda，但目前 torch.cuda.is_available() 為 False。" >&2
+    exit 1
+fi
+
+if [[ -z "$effective_model" ]]; then
+    if [[ "$effective_device" == "cuda" ]]; then
+        if (( vram_mb >= 10000 )); then
+            effective_model="large-v3"
+        elif (( vram_mb >= 6144 )); then
+            effective_model="medium"
+        elif (( vram_mb >= 4096 )); then
+            effective_model="medium"
+        else
+            effective_model="small"
+        fi
+    else
+        effective_model="small"
+    fi
+fi
+
+if [[ -z "$effective_compute_type" ]]; then
+    if [[ "$effective_device" == "cuda" ]]; then
+        if (( vram_mb >= 4096 )); then
+            effective_compute_type="float16"
+        else
+            effective_compute_type="int8"
+        fi
+    else
+        effective_compute_type="int8"
+    fi
+fi
+
+if [[ -z "$effective_batch_size" ]]; then
+    if [[ "$effective_device" == "cuda" ]]; then
+        if (( vram_mb >= 10000 )); then
+            effective_batch_size="8"
+        elif (( vram_mb >= 6144 )); then
+            effective_batch_size="4"
+        elif (( vram_mb >= 4096 )); then
+            effective_batch_size="2"
+        else
+            effective_batch_size="1"
+        fi
+    else
+        effective_batch_size="2"
+    fi
+fi
+
+if (( diarize == 1 )) && [[ "$effective_device" == "cuda" ]] && (( vram_mb > 0 && vram_mb < 6144 )); then
+    if [[ -z "$model" ]]; then
+        effective_model="small"
+    fi
+    if [[ -z "$compute_type" ]]; then
+        effective_compute_type="int8"
+    fi
+    if [[ -z "$batch_size" ]]; then
+        effective_batch_size="1"
+    fi
+fi
+
+hf_auth_ok=0
+check_diarize_access() {
+    local token="${HF_TOKEN:-}"
+    "$PYTHON_BIN" - <<'PY'
+import os
+import sys
+from huggingface_hub import hf_hub_download
+
+token = os.environ.get("HF_TOKEN") or None
+
+try:
+    path = hf_hub_download(
+        repo_id="pyannote/speaker-diarization-community-1",
+        filename="config.yaml",
+        token=token,
+    )
+except Exception as exc:
+    print(exc)
+    raise SystemExit(1)
+else:
+    print(path)
+PY
+}
+
+if (( diarize == 1 )); then
+    if check_diarize_access >/tmp/transcribe-audio-hf-check.$$ 2>&1; then
+        hf_auth_ok=1
+    else
+        echo "錯誤：無法存取 pyannote diarization 模型。" >&2
+        sed -n '1,5p' "/tmp/transcribe-audio-hf-check.$$" >&2 || true
+        rm -f -- "/tmp/transcribe-audio-hf-check.$$"
+        exit 1
+    fi
+    rm -f -- "/tmp/transcribe-audio-hf-check.$$"
+fi
+
+choose_extension() {
+    local codec="$1"
+
+    case "$codec" in
+        aac|alac)
+            echo "m4a"
+            ;;
+        mp3)
+            echo "mp3"
+            ;;
+        flac)
+            echo "flac"
+            ;;
+        opus)
+            echo "opus"
+            ;;
+        vorbis)
+            echo "ogg"
+            ;;
+        ac3)
+            echo "ac3"
+            ;;
+        eac3)
+            echo "eac3"
+            ;;
+        pcm_*)
+            echo "wav"
+            ;;
+        *)
+            echo "mka"
+            ;;
+    esac
+}
+
+validate_audio() {
+    local file="$1"
+
+    [[ -s "$file" ]] &&
+        ffprobe \
+            -v error \
+            -select_streams a:0 \
+            -show_entries stream=codec_name \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$file" 2>/dev/null |
+        grep -q .
+}
+
+detect_audio_codec() {
+    local file="$1"
+
+    ffprobe \
+        -v error \
+        -select_streams a:0 \
+        -show_entries stream=codec_name \
+        -of default=noprint_wrappers=1:nokey=1 \
+        "$file" 2>/dev/null |
+    head -n 1
+}
+
+primary_output_extension() {
+    case "$output_format" in
+        all)
+            echo "txt"
+            ;;
+        *)
+            echo "$output_format"
+            ;;
+    esac
+}
+
+target_dir="$(cd "$target_dir" && pwd)"
+transcript_dir="$target_dir/transcript"
+mkdir -p "$transcript_dir"
+
+audio_scan_file="$(mktemp)"
+video_scan_file="$(mktemp)"
+
+find "$target_dir" \
+    -maxdepth 1 \
+    -type f \
+    \( \
+        -iname '*.m4a'  -o \
+        -iname '*.mp3'  -o \
+        -iname '*.wav'  -o \
+        -iname '*.flac' -o \
+        -iname '*.aac'  -o \
+        -iname '*.ogg'  -o \
+        -iname '*.opus' -o \
+        -iname '*.wma'  -o \
+        -iname '*.mka'  -o \
+        -iname '*.ac3'  -o \
+        -iname '*.eac3' \
+    \) \
+    -print0 | sort -z > "$audio_scan_file"
+
+find "$target_dir" \
+    -maxdepth 1 \
+    -type f \
+    \( \
+        -iname '*.mp4'  -o \
+        -iname '*.m4v'  -o \
+        -iname '*.mkv'  -o \
+        -iname '*.mov'  -o \
+        -iname '*.avi'  -o \
+        -iname '*.webm' -o \
+        -iname '*.wmv'  -o \
+        -iname '*.flv'  -o \
+        -iname '*.ts'   -o \
+        -iname '*.mts'  -o \
+        -iname '*.m2ts' -o \
+        -iname '*.mpg'  -o \
+        -iname '*.mpeg' -o \
+        -iname '*.3gp'  -o \
+        -iname '*.ogv'  -o \
+        -iname '*.vob'  -o \
+        -iname '*.mxf' \
+    \) \
+    -print0 | sort -z > "$video_scan_file"
+
+declare -A preferred_audio_by_stem=()
+declare -A queued_audio_paths=()
+declare -A queued_transcript_stems=()
+
+while IFS= read -r -d '' audio_file; do
+    stem="$(basename "${audio_file%.*}")"
+    if [[ -z "${preferred_audio_by_stem[$stem]:-}" ]]; then
+        preferred_audio_by_stem["$stem"]="$audio_file"
+    fi
+done < "$audio_scan_file"
+
+declare -a transcription_queue=()
+declare -a failed_items=()
+
+audio_found=0
+video_found=0
+audio_extracted=0
+audio_reused=0
+audio_no_stream=0
+audio_extract_failed=0
+transcribe_success=0
+transcribe_failed=0
+transcribe_skipped=0
+transcript_stem_conflicts=0
+
+enqueue_audio_for_transcription() {
+    local audio_path="$1"
+    local stem
+    stem="$(basename "${audio_path%.*}")"
+
+    if [[ -n "${queued_audio_paths[$audio_path]:-}" ]]; then
+        return 0
+    fi
+
+    if [[ -n "${queued_transcript_stems[$stem]:-}" && "${queued_transcript_stems[$stem]}" != "$audio_path" ]]; then
+        echo "[跳過] 逐字稿檔名衝突：${audio_path##*/} 與 ${queued_transcript_stems[$stem]##*/}" >&2
+        failed_items+=("${audio_path##*/}\ttranscript_stem_conflict")
+        transcript_stem_conflicts=$((transcript_stem_conflicts + 1))
+        return 1
+    fi
+
+    queued_audio_paths["$audio_path"]=1
+    queued_transcript_stems["$stem"]="$audio_path"
+    transcription_queue+=("$audio_path")
+    return 0
+}
+
+extract_audio_from_video() {
+    local video_file="$1"
+    local stem codec extension output_file temp_file fallback_file fallback_temp
+
+    stem="$(basename "${video_file%.*}")"
+
+    if [[ -n "${preferred_audio_by_stem[$stem]:-}" && "$force" -eq 0 ]]; then
+        if validate_audio "${preferred_audio_by_stem[$stem]}"; then
+            echo "[沿用] ${video_file##*/} → 已存在音檔：${preferred_audio_by_stem[$stem]##*/}"
+            audio_reused=$((audio_reused + 1))
+            enqueue_audio_for_transcription "${preferred_audio_by_stem[$stem]}"
+            return 0
+        fi
+    fi
+
+    codec="$(detect_audio_codec "$video_file")"
+    if [[ -z "$codec" ]]; then
+        echo "[無音軌] ${video_file##*/}"
+        audio_no_stream=$((audio_no_stream + 1))
+        failed_items+=("${video_file##*/}\tno_audio_stream")
+        return 1
+    fi
+
+    extension="$(choose_extension "$codec")"
+    output_file="$target_dir/$stem.$extension"
+
+    if [[ "$force" -eq 0 && -s "$output_file" && "$(realpath "$output_file")" != "$(realpath "$video_file")" ]] && validate_audio "$output_file"; then
+        echo "[沿用] ${video_file##*/} → ${output_file##*/}"
+        preferred_audio_by_stem["$stem"]="$output_file"
+        audio_reused=$((audio_reused + 1))
+        enqueue_audio_for_transcription "$output_file"
+        return 0
+    fi
+
+    if [[ "$force" -eq 1 ]]; then
+        rm -f -- "$output_file"
+    fi
+
+    temp_file="$target_dir/.${stem}.part.${extension}"
+    rm -f -- "$temp_file"
+
+    echo "[抽取] ${video_file##*/}"
+    echo "       codec=$codec → ${output_file##*/}"
+
+    if ffmpeg \
+        -hide_banner \
+        -loglevel error \
+        -nostdin \
+        -y \
+        -i "$video_file" \
+        -map 0:a:0 \
+        -vn \
+        -sn \
+        -dn \
+        -c:a copy \
+        "$temp_file" &&
+        validate_audio "$temp_file"; then
+        mv -f -- "$temp_file" "$output_file"
+        touch -r "$video_file" "$output_file" 2>/dev/null || true
+        preferred_audio_by_stem["$stem"]="$output_file"
+        audio_extracted=$((audio_extracted + 1))
+        echo "[完成] 直接抽取：${output_file##*/}"
+        enqueue_audio_for_transcription "$output_file"
+        return 0
+    fi
+
+    rm -f -- "$temp_file"
+
+    fallback_file="$target_dir/$stem.flac"
+    if [[ "$force" -eq 0 && -s "$fallback_file" ]] && validate_audio "$fallback_file"; then
+        echo "[沿用] 直接抽取失敗，但 FLAC 已存在：${fallback_file##*/}"
+        preferred_audio_by_stem["$stem"]="$fallback_file"
+        audio_reused=$((audio_reused + 1))
+        enqueue_audio_for_transcription "$fallback_file"
+        return 0
+    fi
+
+    if [[ "$force" -eq 1 ]]; then
+        rm -f -- "$fallback_file"
+    fi
+
+    fallback_temp="$target_dir/.${stem}.part.flac"
+    rm -f -- "$fallback_temp"
+    echo "[轉換] 無法直接抽取，改轉無損 FLAC。"
+
+    if ffmpeg \
+        -hide_banner \
+        -loglevel error \
+        -nostdin \
+        -y \
+        -i "$video_file" \
+        -map 0:a:0 \
+        -vn \
+        -sn \
+        -dn \
+        -c:a flac \
+        -compression_level 5 \
+        "$fallback_temp" &&
+        validate_audio "$fallback_temp"; then
+        mv -f -- "$fallback_temp" "$fallback_file"
+        touch -r "$video_file" "$fallback_file" 2>/dev/null || true
+        preferred_audio_by_stem["$stem"]="$fallback_file"
+        audio_extracted=$((audio_extracted + 1))
+        echo "[完成] 轉成 FLAC：${fallback_file##*/}"
+        enqueue_audio_for_transcription "$fallback_file"
+        return 0
+    fi
+
+    rm -f -- "$fallback_temp"
+    echo "[失敗] 無法從 ${video_file##*/} 抽出音軌" >&2
+    audio_extract_failed=$((audio_extract_failed + 1))
+    failed_items+=("${video_file##*/}\textract_failed")
+    return 1
+}
+
+echo "來源目錄：$target_dir"
+echo "輸出目錄：$transcript_dir"
+echo "模式：批次轉錄"
+echo "說話者分離：$([[ "$diarize" -eq 1 ]] && echo '開啟' || echo '關閉')"
+echo
+echo "[檢查] whisperx：OK (${whisperx_version:-unknown})"
+echo "[檢查] python：OK (${python_version:-unknown})"
+echo "[檢查] torch：OK (${torch_version:-unknown})"
+
+if [[ "$cuda_available" == "True" ]]; then
+    echo "[檢查] CUDA：OK (${gpu_name:-unknown}, ${vram_mb}MB, runtime ${cuda_runtime:-unknown})"
+else
+    echo "[檢查] CUDA：未啟用，將使用 CPU"
+fi
+
+if (( diarize == 1 )); then
+    echo "[檢查] pyannote token：OK"
+fi
+
+echo
+echo "最終參數："
+echo "  device=$effective_device"
+echo "  model=$effective_model"
+echo "  compute_type=$effective_compute_type"
+echo "  batch_size=$effective_batch_size"
+echo "  language=$language"
+echo "  output_format=$output_format"
+echo
+
+while IFS= read -r -d '' audio_file; do
+    audio_found=$((audio_found + 1))
+    enqueue_audio_for_transcription "$audio_file" || true
+done < "$audio_scan_file"
+
+while IFS= read -r -d '' video_file; do
+    video_found=$((video_found + 1))
+    extract_audio_from_video "$video_file" || true
+done < "$video_scan_file"
+
+rm -f -- "$audio_scan_file" "$video_scan_file"
+
+echo "掃描結果："
+echo "  找到音檔：$audio_found"
+echo "  找到影片：$video_found"
+echo "  待轉錄檔：${#transcription_queue[@]}"
+echo
+
+if (( check_only == 1 )); then
+    echo "--check 模式，不執行轉錄。"
+    exit 0
+fi
+
+if (( ${#transcription_queue[@]} == 0 )); then
+    echo "沒有找到可轉錄的音檔。"
+    exit 0
+fi
+
+primary_ext="$(primary_output_extension)"
+summary_file="$transcript_dir/_run-summary.txt"
+env_file="$transcript_dir/_environment.txt"
+failed_file="$transcript_dir/_failed-files.txt"
+
+{
+    echo "python_version=$python_version"
+    echo "whisperx_version=$whisperx_version"
+    echo "torch_version=$torch_version"
+    echo "cuda_available=$cuda_available"
+    echo "cuda_runtime=$cuda_runtime"
+    echo "gpu_name=$gpu_name"
+    echo "vram_mb=$vram_mb"
+    echo "device=$effective_device"
+    echo "model=$effective_model"
+    echo "compute_type=$effective_compute_type"
+    echo "batch_size=$effective_batch_size"
+    echo "language=$language"
+    echo "output_format=$output_format"
+    echo "diarize=$diarize"
+} > "$env_file"
+
+if [[ -e "$failed_file" ]]; then
+    rm -f -- "$failed_file"
+fi
+
+for input_file in "${transcription_queue[@]}"; do
+    stem="$(basename "${input_file%.*}")"
+    primary_output="$transcript_dir/$stem.$primary_ext"
+
+    if [[ -s "$primary_output" && "$force" -eq 0 ]]; then
+        echo "[跳過] ${input_file##*/} → 已存在：${primary_output##*/}"
+        transcribe_skipped=$((transcribe_skipped + 1))
+        continue
+    fi
+
+    if [[ "$force" -eq 1 ]]; then
+        rm -f -- \
+            "$transcript_dir/$stem.txt" \
+            "$transcript_dir/$stem.json" \
+            "$transcript_dir/$stem.srt" \
+            "$transcript_dir/$stem.vtt" \
+            "$transcript_dir/$stem.tsv" \
+            "$transcript_dir/$stem.aud"
+    fi
+
+    cmd=(
+        "$WHISPERX_BIN"
+        "$input_file"
+        --model "$effective_model"
+        --language "$language"
+        --device "$effective_device"
+        --compute_type "$effective_compute_type"
+        --batch_size "$effective_batch_size"
+        --output_format "$output_format"
+        --output_dir "$transcript_dir"
+    )
+
+    if (( diarize == 1 )); then
+        cmd+=(--diarize)
+        if [[ -n "${HF_TOKEN:-}" ]]; then
+            cmd+=(--hf_token "$HF_TOKEN")
+        fi
+        if [[ -n "$min_speakers" ]]; then
+            cmd+=(--min_speakers "$min_speakers")
+        fi
+        if [[ -n "$max_speakers" ]]; then
+            cmd+=(--max_speakers "$max_speakers")
+        fi
+    fi
+
+    echo "[轉錄] ${input_file##*/}"
+    if (( verbose == 1 )); then
+        printf '       '
+        printf '%q ' "${cmd[@]}"
+        printf '\n'
+    fi
+
+    if "${cmd[@]}"; then
+        if [[ -s "$primary_output" ]]; then
+            echo "[完成] ${primary_output##*/}"
+            transcribe_success=$((transcribe_success + 1))
+        else
+            echo "[失敗] ${input_file##*/}：未找到輸出 ${primary_output##*/}" >&2
+            echo -e "${input_file##*/}\tmissing_output" >> "$failed_file"
+            transcribe_failed=$((transcribe_failed + 1))
+        fi
+    else
+        echo "[失敗] ${input_file##*/}" >&2
+        echo -e "${input_file##*/}\twhisperx_failed" >> "$failed_file"
+        transcribe_failed=$((transcribe_failed + 1))
+    fi
+done
+
+for item in "${failed_items[@]}"; do
+    echo -e "$item" >> "$failed_file"
+done
+
+{
+    echo "source_dir=$target_dir"
+    echo "transcript_dir=$transcript_dir"
+    echo "audio_found=$audio_found"
+    echo "video_found=$video_found"
+    echo "audio_extracted=$audio_extracted"
+    echo "audio_reused=$audio_reused"
+    echo "audio_no_stream=$audio_no_stream"
+    echo "audio_extract_failed=$audio_extract_failed"
+    echo "transcript_stem_conflicts=$transcript_stem_conflicts"
+    echo "transcribe_queue=${#transcription_queue[@]}"
+    echo "transcribe_success=$transcribe_success"
+    echo "transcribe_failed=$transcribe_failed"
+    echo "transcribe_skipped=$transcribe_skipped"
+    echo "device=$effective_device"
+    echo "model=$effective_model"
+    echo "compute_type=$effective_compute_type"
+    echo "batch_size=$effective_batch_size"
+    echo "language=$language"
+    echo "output_format=$output_format"
+    echo "diarize=$diarize"
+} > "$summary_file"
+
+echo
+echo "處理完成"
+echo "--------------------------------"
+echo "找到音檔：       $audio_found"
+echo "找到影片：       $video_found"
+echo "抽出音軌：       $audio_extracted"
+echo "沿用既有音檔：   $audio_reused"
+echo "待轉錄檔：       ${#transcription_queue[@]}"
+echo "成功：           $transcribe_success"
+echo "跳過：           $transcribe_skipped"
+echo "失敗：           $transcribe_failed"
+echo "摘要：           $summary_file"
+
+if (( audio_no_stream > 0 || audio_extract_failed > 0 || transcript_stem_conflicts > 0 )); then
+    echo "附加失敗：       $failed_file"
+fi
+
+if (( transcribe_failed > 0 || audio_extract_failed > 0 )); then
+    exit 3
+fi
