@@ -2,7 +2,6 @@
 import argparse
 import importlib.metadata
 import importlib.util
-import os
 import platform
 import re
 import sys
@@ -15,6 +14,11 @@ DEFAULT_MODEL = "Qwen/Qwen2.5-3B-Instruct"
 DEFAULT_OUTPUT_DIR = "formatted"
 SUPPORTED_EXTENSIONS = {".txt", ".md"}
 EXCLUDED_INPUT_NAMES = {"_run-summary.txt", "_environment.txt"}
+MAX_NEW_TOKENS = 4096
+PROMPT_SAFETY_MARGIN_TOKENS = 512
+REPAIR_MIN_RATIO = 0.7
+SOURCE_MIN_RATIO = 0.3
+GENERIC_TITLE_HINTS = {"逐字稿", "transcript", "formatted", "polished"}
 
 SYSTEM_PROMPT = """你是一個專業的繁體中文文章編輯與排版助理。你的任務是將逐字稿整理為台灣習慣的繁體中文 Markdown。
 
@@ -31,10 +35,11 @@ REPAIR_PROMPT = """你是一個嚴格的繁體中文逐字稿修稿助理。請�
 必須嚴格遵守以下規則：
 1. 不得新增原始逐字稿沒有的資訊。
 2. 必須改為台灣常用繁體中文，避免簡繁混雜。
-3. 不得混入英文單字、英文句子、分隔線或程式碼區塊標記。
-4. 修正明顯的語音辨識錯字與不自然斷句。
-5. 只在主題非常明確時才加標題；若全文主題單一，可以不加標題。
-6. 最終只輸出可直接存檔的 Markdown 正文。"""
+3. 若原文本來就包含英文術語、產品名、指令、型號或版本號，必須保留其識別性；不得主動新增無關英文。
+4. 不得輸出分隔線、程式碼區塊標記或模型說明文字。
+5. 修正明顯的語音辨識錯字與不自然斷句。
+6. 只在主題非常明確時才加標題；若全文主題單一，可以不加標題。
+7. 最終只輸出可直接存檔的 Markdown 正文。"""
 
 BUILTIN_REPLACEMENTS = {
     "POA": "PUA",
@@ -77,6 +82,13 @@ class LoadedModel:
     model: object
     device: str
     dtype_name: str
+
+
+@dataclass
+class FileJob:
+    input_path: Path
+    output_path: Path
+    skip: bool
 
 
 def load_opencc_converter():
@@ -204,10 +216,12 @@ def resolve_output_dir(args: argparse.Namespace, base_dir: Path) -> Path:
     output_value = args.output_dir
     candidate = Path(output_value).expanduser()
     if candidate.is_absolute():
-        return candidate.resolve()
-    if candidate.parts and len(candidate.parts) > 1:
-        return (Path.cwd() / candidate).resolve()
-    return (base_dir / output_value).resolve()
+        output_dir = candidate.resolve()
+    else:
+        output_dir = (base_dir / candidate).resolve()
+    if output_dir == base_dir.resolve():
+        raise UserFacingError("錯誤：輸出目錄不可與輸入 base directory 相同。")
+    return output_dir
 
 
 def load_replace_dict(path_str: Optional[str]) -> Dict[str, str]:
@@ -219,22 +233,46 @@ def load_replace_dict(path_str: Optional[str]) -> Dict[str, str]:
         raise UserFacingError(f"錯誤：替換詞彙表不存在：{path}")
 
     replacements: Dict[str, str] = {}
-    with path.open("r", encoding="utf-8") as handle:
-        for line_no, raw_line in enumerate(handle, 1):
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=>" not in line:
-                raise UserFacingError(
-                    f"錯誤：替換詞彙表格式錯誤：{path}:{line_no}: {raw_line.rstrip()}"
-                )
-            source, target = [part.strip() for part in line.split("=>", 1)]
-            if not source or not target:
-                raise UserFacingError(
-                    f"錯誤：替換詞彙表格式錯誤：{path}:{line_no}: {raw_line.rstrip()}"
-                )
-            replacements[source] = target
+    for line_no, raw_line in enumerate(read_text_file(path).splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=>" not in line:
+            raise UserFacingError(
+                f"錯誤：替換詞彙表格式錯誤：{path}:{line_no}: {raw_line.rstrip()}"
+            )
+        source, target = [part.strip() for part in line.split("=>", 1)]
+        if not source or not target:
+            raise UserFacingError(
+                f"錯誤：替換詞彙表格式錯誤：{path}:{line_no}: {raw_line.rstrip()}"
+            )
+        replacements[source] = target
     return replacements
+
+
+def resolve_output_path(input_path: Path, output_dir: Path) -> Path:
+    return output_dir / f"{input_path.stem}.md"
+
+
+def build_file_jobs(files: Sequence[Path], output_dir: Path, force: bool) -> List[FileJob]:
+    output_map: Dict[Path, Path] = {}
+    jobs: List[FileJob] = []
+    for input_path in files:
+        output_path = resolve_output_path(input_path, output_dir)
+        if output_path in output_map:
+            other_input = output_map[output_path]
+            raise UserFacingError(
+                f"錯誤：輸出檔名衝突：{other_input.name} 與 {input_path.name} 都會輸出到 {output_path}"
+            )
+        output_map[output_path] = input_path
+        jobs.append(
+            FileJob(
+                input_path=input_path,
+                output_path=output_path,
+                skip=output_path.exists() and not force,
+            )
+        )
+    return jobs
 
 
 def load_style_guide(path_str: Optional[str]) -> str:
@@ -244,13 +282,31 @@ def load_style_guide(path_str: Optional[str]) -> str:
     path = Path(path_str).expanduser().resolve()
     if not path.is_file():
         raise UserFacingError(f"錯誤：style guide 不存在：{path}")
-    return path.read_text(encoding="utf-8").strip()
+    return read_text_file(path).strip()
+
+
+def merge_replacements(
+    builtin_replacements: Dict[str, str], external_replacements: Dict[str, str]
+) -> Dict[str, str]:
+    merged = dict(builtin_replacements)
+    merged.update(external_replacements)
+    return merged
 
 
 def apply_replacements(content: str, replacements: Dict[str, str]) -> str:
-    for source, target in replacements.items():
-        content = content.replace(source, target)
-    return content
+    if not replacements:
+        return content
+    pattern = re.compile(
+        "|".join(
+            re.escape(source)
+            for source in sorted(replacements.keys(), key=len, reverse=True)
+        )
+    )
+    return pattern.sub(lambda match: replacements[match.group(0)], content)
+
+
+def read_text_file(path: Path) -> str:
+    return path.read_text(encoding="utf-8-sig")
 
 
 def normalize_transcript_text(content: str, converter) -> str:
@@ -264,11 +320,13 @@ def derive_title_hint(input_path: Path) -> str:
     stem = input_path.stem.strip()
     if not stem:
         return ""
-    if "#" in stem:
-        return ""
-    if re.search(r"[A-Za-z]{3,}", stem):
+    if stem.lower() in GENERIC_TITLE_HINTS:
         return ""
     if not re.search(r"[\u4e00-\u9fff]", stem):
+        return ""
+    if re.fullmatch(r"[\W_\d]+", stem):
+        return ""
+    if re.fullmatch(r"[\d\-_/年月日\s]+", stem):
         return ""
     return stem[:30]
 
@@ -334,6 +392,21 @@ def build_repair_messages(
     ]
 
 
+def is_wrapper_line(line: str) -> bool:
+    normalized = line.strip()
+    if not normalized:
+        return False
+    wrapper_prefixes = (
+        "以下是整理後的",
+        "以下為整理後的",
+        "以下是校正後的",
+        "以下為校正後的",
+        "這是整理後的",
+        "這是校正後的",
+    )
+    return normalized.startswith(wrapper_prefixes)
+
+
 def clean_response(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
@@ -345,17 +418,49 @@ def clean_response(text: str) -> str:
         text = "\n".join(lines).strip()
 
     lines = [line for line in text.splitlines() if line.strip() not in {"---", "***"}]
-    while lines and is_trailing_note(lines[-1]):
+    while lines and is_wrapper_line(lines[0]):
+        lines.pop(0)
+    while lines and is_wrapper_line(lines[-1]):
         lines.pop()
     return "\n".join(lines).strip()
 
 
-def is_trailing_note(line: str) -> bool:
-    normalized = line.strip()
-    if not normalized:
-        return False
-    keywords = ("完成", "校正", "排版", "繁體", "修正")
-    return len(normalized) < 50 and any(keyword in normalized for keyword in keywords)
+def render_prompt(tokenizer, messages: List[Dict[str, str]]) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+    except Exception as exc:
+        raise UserFacingError(f"錯誤：無法建立模型對話模板：{exc}") from exc
+
+
+def count_prompt_tokens(tokenizer, prompt_text: str) -> int:
+    encoded = tokenizer(prompt_text, return_attention_mask=False)
+    return len(encoded["input_ids"])
+
+
+def get_model_context_limit(loaded_model: LoadedModel) -> int:
+    candidates: List[int] = []
+    model_limit = getattr(loaded_model.model.config, "max_position_embeddings", None)
+    tokenizer_limit = getattr(loaded_model.tokenizer, "model_max_length", None)
+    for value in (model_limit, tokenizer_limit):
+        if isinstance(value, int) and 0 < value < 1_000_000:
+            candidates.append(value)
+    if not candidates:
+        raise UserFacingError("錯誤：無法判斷模型 context 上限。")
+    return min(candidates)
+
+
+def ensure_prompt_within_budget(
+    loaded_model: LoadedModel, prompt_text: str, label: str
+) -> None:
+    context_limit = get_model_context_limit(loaded_model)
+    prompt_tokens = count_prompt_tokens(loaded_model.tokenizer, prompt_text)
+    safe_budget = context_limit - MAX_NEW_TOKENS - PROMPT_SAFETY_MARGIN_TOKENS
+    if prompt_tokens > safe_budget:
+        raise UserFacingError(
+            f"錯誤：{label} 過長（prompt_tokens={prompt_tokens}，安全上限={safe_budget}）。"
+        )
 
 
 def load_model(model_name: str) -> LoadedModel:
@@ -403,16 +508,9 @@ def load_model(model_name: str) -> LoadedModel:
         raise UserFacingError(f"錯誤：模型載入失敗：{model_name}: {exc}{hint}") from exc
 
 
-def generate_response(loaded_model: LoadedModel, messages: List[Dict[str, str]]) -> str:
+def generate_response(loaded_model: LoadedModel, prompt_text: str) -> str:
     model = loaded_model.model
     tokenizer = loaded_model.tokenizer
-
-    try:
-        prompt_text = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-    except Exception as exc:
-        raise UserFacingError(f"錯誤：無法建立模型對話模板：{exc}") from exc
 
     try:
         import torch  # type: ignore
@@ -432,22 +530,97 @@ def generate_response(loaded_model: LoadedModel, messages: List[Dict[str, str]])
         for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
     ]
     response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    return clean_response(response)
+    return response
 
 
-def should_repair_output(draft: str, converter) -> bool:
+def contains_packaging_text(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+    if "```" in normalized:
+        return True
+    lowered = normalized.lower()
+    packaging_markers = (
+        "以下是整理後的",
+        "以下為整理後的",
+        "以下是校正後的",
+        "以下為校正後的",
+        "這是整理後的",
+        "這是校正後的",
+        "希望這份",
+        "如果你還需要",
+        "markdown 內容如下",
+    )
+    return any(marker in normalized for marker in packaging_markers) or "as an ai" in lowered
+
+
+def should_repair_output(draft: str) -> bool:
     if not draft:
         return True
-    if re.search(r"[A-Za-z]{4,}", draft):
+    if contains_packaging_text(draft):
         return True
     if "\n---\n" in draft or draft.startswith("---") or draft.endswith("---"):
         return True
     paragraphs = [part.strip() for part in draft.split("\n\n") if part.strip()]
     if len(paragraphs) < 2 and len(draft) > 500:
         return True
-    if converter is not None and converter.convert(draft) != draft:
-        return True
     return False
+
+
+def extract_number_tokens(text: str) -> List[str]:
+    return re.findall(r"\d+(?:[./:-]\d+)*", text)
+
+
+def extract_english_terms(text: str) -> List[str]:
+    return re.findall(r"[A-Za-z][A-Za-z0-9._/-]*", text)
+
+
+def missing_reference_numbers(reference_text: str, candidate_text: str) -> bool:
+    candidate_numbers = set(extract_number_tokens(candidate_text))
+    reference_numbers = set(extract_number_tokens(reference_text))
+    return bool(reference_numbers and not reference_numbers.issubset(candidate_numbers))
+
+
+def lost_too_many_english_terms(reference_text: str, candidate_text: str) -> bool:
+    reference_terms = {term.lower() for term in extract_english_terms(reference_text)}
+    if not reference_terms:
+        return False
+    candidate_lower = candidate_text.lower()
+    retained = sum(1 for term in reference_terms if term in candidate_lower)
+    if len(reference_terms) <= 2:
+        return retained < len(reference_terms)
+    return retained < max(1, len(reference_terms) // 2)
+
+
+def is_abnormally_short(candidate_text: str, reference_text: str, ratio: float) -> bool:
+    if len(reference_text) < 200:
+        return False
+    return len(candidate_text) < max(40, int(len(reference_text) * ratio))
+
+
+def validate_repair_output(
+    repaired_text: str, draft_text: str, original_content: str
+) -> bool:
+    if not repaired_text:
+        return False
+    if contains_packaging_text(repaired_text):
+        return False
+    if draft_text:
+        if len(repaired_text) < max(20, int(len(draft_text) * REPAIR_MIN_RATIO)):
+            return False
+        if missing_reference_numbers(draft_text, repaired_text):
+            return False
+        if lost_too_many_english_terms(draft_text, repaired_text):
+            return False
+        return True
+
+    if is_abnormally_short(repaired_text, original_content, SOURCE_MIN_RATIO):
+        return False
+    if missing_reference_numbers(original_content, repaired_text):
+        return False
+    if lost_too_many_english_terms(original_content, repaired_text):
+        return False
+    return True
 
 
 def process_text(
@@ -457,26 +630,37 @@ def process_text(
     title_hint: str,
     converter,
 ) -> str:
-    draft = generate_response(loaded_model, build_messages(content, style_guide, title_hint))
+    initial_messages = build_messages(content, style_guide, title_hint)
+    initial_prompt = render_prompt(loaded_model.tokenizer, initial_messages)
+    ensure_prompt_within_budget(loaded_model, initial_prompt, "初稿 prompt")
+    draft = generate_response(loaded_model, initial_prompt)
     if converter is not None:
         draft = converter.convert(draft)
     draft = clean_response(draft)
 
-    if should_repair_output(draft, converter):
-        repaired = generate_response(
-            loaded_model,
-            build_repair_messages(content, draft, style_guide, title_hint),
-        )
+    if should_repair_output(draft):
+        repair_messages = build_repair_messages(content, draft, style_guide, title_hint)
+        repair_prompt = render_prompt(loaded_model.tokenizer, repair_messages)
+        ensure_prompt_within_budget(loaded_model, repair_prompt, "repair prompt")
+        repaired = generate_response(loaded_model, repair_prompt)
         if converter is not None:
             repaired = converter.convert(repaired)
         repaired = clean_response(repaired)
-        if repaired:
+        if validate_repair_output(repaired, draft, content):
             draft = repaired
 
+    if not draft:
+        raise UserFacingError("錯誤：模型輸出為空。")
     if title_hint and not re.search(r"^\s{0,3}#{1,6}\s", draft, flags=re.MULTILINE):
         draft = f"# {title_hint}\n\n{draft}".strip()
-
-    return draft
+    final_output = clean_response(draft)
+    if not final_output:
+        raise UserFacingError("錯誤：模型輸出為空。")
+    if is_abnormally_short(final_output, content, SOURCE_MIN_RATIO):
+        raise UserFacingError("錯誤：模型輸出異常短，疑似截斷。")
+    if contains_packaging_text(final_output):
+        raise UserFacingError("錯誤：模型輸出包含與正文無關的包裝文字。")
+    return final_output
 
 
 def format_bool(value: bool) -> str:
@@ -577,12 +761,52 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
 
         output_dir = resolve_output_dir(args, base_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
         external_replacements = load_replace_dict(args.replace_dict)
         style_guide = load_style_guide(args.style_guide)
+        jobs = build_file_jobs(files, output_dir, args.force)
         runtime_info = detect_runtime_info()
         converter = load_opencc_converter()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        counts = {
+            "success": 0,
+            "skipped": sum(1 for job in jobs if job.skip),
+            "failed": 0,
+        }
+        queued_jobs = [job for job in jobs if not job.skip]
+
+        if not queued_jobs:
+            print_run_config(
+                source_label=source_label,
+                file_count=len(files),
+                output_dir=output_dir,
+                model_name=args.model,
+                runtime_info=runtime_info,
+                replace_dict_path=args.replace_dict,
+                style_guide_path=args.style_guide,
+                force=args.force,
+                device="not_loaded",
+                dtype_name="not_loaded",
+            )
+            print(f"[run] queued={len(files)}")
+            for index, job in enumerate(jobs, 1):
+                print(f"[{index}/{len(jobs)}] skipped -> {job.output_path}")
+            write_summary_files(
+                output_dir=output_dir,
+                source_label=source_label,
+                files=files,
+                args=args,
+                runtime_info=runtime_info,
+                device="not_loaded",
+                dtype_name="not_loaded",
+                counts=counts,
+            )
+            print(
+                f"[summary] total={len(files)} success={counts['success']} "
+                f"skipped={counts['skipped']} failed={counts['failed']}"
+            )
+            print(f"[summary] output_dir={output_dir}")
+            return 0
 
         print(f"正在載入模型 {args.model}...", flush=True)
         loaded_model = load_model(args.model)
@@ -602,23 +826,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         print(f"[run] queued={len(files)}")
 
-        counts = {"success": 0, "skipped": 0, "failed": 0}
-        all_replacements = dict(BUILTIN_REPLACEMENTS)
-        all_replacements.update(external_replacements)
+        all_replacements = merge_replacements(BUILTIN_REPLACEMENTS, external_replacements)
 
-        for index, input_path in enumerate(files, 1):
-            output_path = output_dir / f"{input_path.stem}.md"
-            if output_path.exists() and not args.force:
-                print(f"[{index}/{len(files)}] skipped -> {output_path}")
-                counts["skipped"] += 1
+        for index, job in enumerate(jobs, 1):
+            if job.skip:
+                print(f"[{index}/{len(files)}] skipped -> {job.output_path}")
                 continue
 
-            print(f"[{index}/{len(files)}] processing {input_path.name}")
+            print(f"[{index}/{len(files)}] processing {job.input_path.name}")
             try:
-                raw_content = input_path.read_text(encoding="utf-8")
-                processed_input = apply_replacements(raw_content, all_replacements)
-                processed_input = normalize_transcript_text(processed_input, converter)
-                title_hint = derive_title_hint(input_path)
+                raw_content = read_text_file(job.input_path)
+                processed_input = normalize_transcript_text(raw_content, converter)
+                processed_input = apply_replacements(processed_input, all_replacements)
+                title_hint = derive_title_hint(job.input_path)
                 result = process_text(
                     processed_input,
                     loaded_model,
@@ -626,11 +846,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     title_hint,
                     converter,
                 )
-                output_path.write_text(result + ("\n" if result and not result.endswith("\n") else ""), encoding="utf-8")
-                print(f"[{index}/{len(files)}] done -> {output_path}")
+                job.output_path.write_text(
+                    result + ("\n" if result and not result.endswith("\n") else ""),
+                    encoding="utf-8",
+                )
+                print(f"[{index}/{len(files)}] done -> {job.output_path}")
                 counts["success"] += 1
             except Exception as exc:
-                print(f"[{index}/{len(files)}] failed -> {input_path.name}: {exc}")
+                print(f"[{index}/{len(files)}] failed -> {job.input_path.name}: {exc}")
                 counts["failed"] += 1
 
         write_summary_files(
