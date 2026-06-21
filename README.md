@@ -7,7 +7,9 @@
 正式文件集中放在 `docs/`：
 
 - 安裝說明：[docs/INSTALL.md](docs/INSTALL.md)
-- 整合流程舊 CR / pending 紀錄：[docs/SDD-CR-integrated-pipeline-readiness.md](docs/SDD-CR-integrated-pipeline-readiness.md)
+- 整合流程舊 CR / pending 紀錄：[docs/SDD-CR-001-integrated-pipeline-readiness.md](docs/SDD-CR-001-integrated-pipeline-readiness.md)
+- CR 文件命名規則：`docs/SDD-CR-###-<slug>.md`，同一 repo 內依建立順序遞增編號。
+- Bug fix 文件命名規則：`docs/SDD-BUGFIX-###-<slug>.md`，同一 repo 內依建立順序遞增編號。
 
 ## 功能
 
@@ -31,7 +33,7 @@ extract-audio/
 │   └── extract-audio
 └── docs/
     ├── INSTALL.md
-    └── SDD-CR-integrated-pipeline-readiness.md
+    └── SDD-CR-001-integrated-pipeline-readiness.md
 ```
 
 ## 快速開始
