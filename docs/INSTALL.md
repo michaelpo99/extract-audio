@@ -3,10 +3,10 @@
 這個專案提供一支 Bash 指令：
 
 ```text
-transcribe-audio
+extract-audio
 ```
 
-用途是掃描目錄中的音檔與影片檔，必要時先抽音軌，再用 WhisperX 批次轉文字。
+用途是掃描指定目錄中的影片檔，抽取第一條音軌，並輸出到目標目錄下的 `audio/` 子目錄。
 
 ## 1. 安裝系統依賴
 
@@ -14,7 +14,7 @@ transcribe-audio
 
 ```bash
 sudo apt update
-sudo apt install -y ffmpeg python3-venv
+sudo apt install -y ffmpeg
 ```
 
 確認 FFmpeg 與 FFprobe 可用：
@@ -24,66 +24,45 @@ ffmpeg -version
 ffprobe -version
 ```
 
+本工具不需要 Python、WhisperX、Torch、CUDA 或 Hugging Face 權限。
+
 ## 2. 取得專案
 
 ```bash
-git clone https://github.com/michaelpo99/transcribe-audio.git
-cd transcribe-audio
+git clone https://github.com/michaelpo99/extract-audio.git
+cd extract-audio
 ```
 
 若你是本機手動建立或測試，也可以直接進入專案目錄：
 
 ```bash
-cd ~/transcribe-audio
+cd ~/extract-audio
 ```
 
-## 3. 準備 WhisperX 環境
-
-```bash
-python3 -m venv "$HOME/.venvs/whisperx"
-source "$HOME/.venvs/whisperx/bin/activate"
-python -m pip install --upgrade pip setuptools wheel
-pip install whisperx
-```
-
-確認：
-
-```bash
-"$HOME/.venvs/whisperx/bin/whisperx" --help
-"$HOME/.venvs/whisperx/bin/python" -c "import torch; print(torch.cuda.is_available())"
-```
-
-若要使用 `--diarize`，還需要：
-
-1. Hugging Face 帳號。
-2. 可讀取 `pyannote/speaker-diarization-community-1` 的權限。
-3. 可用的 `HF_TOKEN`，或已登入 Hugging Face CLI。
-
-## 4. 直接執行
+## 3. 直接執行
 
 先給執行權限：
 
 ```bash
-chmod +x ./bin/transcribe-audio
+chmod +x ./bin/extract-audio
 ```
 
 直接使用：
 
 ```bash
-./bin/transcribe-audio
-./bin/transcribe-audio --check
-./bin/transcribe-audio "/mnt/d/Videos/Meeting"
-./bin/transcribe-audio --diarize "/mnt/d/Videos/Meeting"
+./bin/extract-audio
+./bin/extract-audio "/mnt/d/Videos/Meeting"
+./bin/extract-audio --force "/mnt/d/Videos/Meeting"
 ```
 
-## 5. 安裝成全域指令
+## 4. 安裝成全域指令
 
 建立個人 `bin` 目錄並複製腳本：
 
 ```bash
 mkdir -p ~/bin
-cp ./bin/transcribe-audio ~/bin/transcribe-audio
-chmod +x ~/bin/transcribe-audio
+cp ./bin/extract-audio ~/bin/extract-audio
+chmod +x ~/bin/extract-audio
 ```
 
 把 `~/bin` 加入 PATH：
@@ -102,61 +81,51 @@ source ~/.bashrc
 確認安裝：
 
 ```bash
-which transcribe-audio
-transcribe-audio --help
-transcribe-audio --check
+which extract-audio
+extract-audio --help
 ```
 
-## 6. 更新安裝
+## 5. 更新安裝
 
 若腳本有新版本：
 
 ```bash
-cd ~/transcribe-audio
-cp ./bin/transcribe-audio ~/bin/transcribe-audio
-chmod +x ~/bin/transcribe-audio
+cd ~/extract-audio
+cp ./bin/extract-audio ~/bin/extract-audio
+chmod +x ~/bin/extract-audio
 ```
 
-若 WhisperX 環境也有更新需求：
-
-```bash
-source "$HOME/.venvs/whisperx/bin/activate"
-pip install --upgrade whisperx
-```
-
-## 7. 驗證
+## 6. 驗證
 
 最小驗證：
 
 ```bash
-transcribe-audio --help
-transcribe-audio --check
+extract-audio --help
 ```
 
-若要驗證 diarization：
+實際驗證可準備一個包含影片檔的目錄：
 
 ```bash
-export HF_TOKEN="你的 token"
-transcribe-audio --check --diarize
+extract-audio "/mnt/d/Videos/Meeting"
 ```
 
-## 8. 移除
+預期會在目標目錄下產生：
+
+```text
+Meeting/audio/
+```
+
+## 7. 移除
 
 只移除全域指令：
 
 ```bash
-rm -f ~/bin/transcribe-audio
-```
-
-移除 WhisperX 虛擬環境：
-
-```bash
-rm -rf "$HOME/.venvs/whisperx"
+rm -f ~/bin/extract-audio
 ```
 
 移除專案目錄：
 
 ```bash
 cd ~
-rm -rf ~/transcribe-audio
+rm -rf ~/extract-audio
 ```
