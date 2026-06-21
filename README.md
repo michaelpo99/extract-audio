@@ -26,6 +26,7 @@
 extract-audio/
 ├── .gitignore
 ├── README.md
+├── install.sh
 ├── bin/
 │   └── extract-audio
 └── docs/
@@ -42,7 +43,13 @@ sudo apt update
 sudo apt install -y ffmpeg
 ```
 
-直接執行專案內腳本：
+安裝 CLI：
+
+```bash
+bash install.sh
+```
+
+直接執行專案內腳本也可以：
 
 ```bash
 ./bin/extract-audio
@@ -50,7 +57,7 @@ sudo apt install -y ffmpeg
 ./bin/extract-audio --force "/mnt/d/Videos/Meeting"
 ```
 
-若想安裝成全域指令，請看 [docs/INSTALL.md](docs/INSTALL.md)。
+若想指定安裝位置，請看 [docs/INSTALL.md](docs/INSTALL.md)。
 
 ## 用法
 
