@@ -2,553 +2,359 @@
 
 狀態：Proposed
 日期：2026-06-21
-適用 repo：transcript-polish
+適用 repo：extract-audio
 
 ## 1. 背景與目的
 
-`transcript-polish` 目前定位為 conservative transcript polishing CLI，負責將 ASR 原始逐字稿整理成忠實、可讀、保留原語氣與詞彙選擇的繁體中文 Markdown。
+本 repo 目前提供 `extract-audio` 與 `transcribe-audio`。其中 `transcribe-audio` 已經是前段 pipeline 工具：它會掃描來源目錄第一層的音檔與影片檔，遇到影片時可先抽出第一條音軌，再呼叫 WhisperX 產生逐字稿。
 
-未來若要把 `extract-audio`、`transcribe-audio`、`transcript-polish` 合併成同一工具集，合併前必須先讓 `transcript-polish` 成為穩定的 transcript consumer 與 polished markdown producer。此 CR 的目標不是改變潤稿模型策略，也不是立即建立合併後 monorepo，而是先修正輸入掃描、輸出路徑與 metadata 邊界，使它能無痛接在 `transcribe-audio` 的 sidecar 輸出後面。
+未來若要把 `extract-audio`、`transcribe-audio`、`transcript-polish` 合併成同一工具集，合併前應先讓本 repo 成為穩定的 media/transcript producer。此 CR 不要求立即合併 repo，也不要求立即改寫成 Python monorepo；目標是先建立一致的目錄契約、輸出契約與 metadata 邊界。
 
-核心方向：
+核心原則：
 
-- `transcript-polish` 應只處理正文逐字稿，不處理 summary、environment、failed list 等控制檔。
-- 對於 `Meeting.transcript/` 這類整合流程輸入，預設輸出應是 sibling `Meeting.polished/`，而不是 `Meeting.transcript/formatted/`。
-- metadata 應能輸出到獨立 `Meeting.meta/`，避免混入 polished markdown 目錄。
-- 保留既有單獨使用情境，讓一般 `transcript-polish --dir ./some-dir` 不會被過度假設為整合 pipeline。
+- 來源目錄視為 media pool，可同時放影片與音檔。
+- 不預設建立 `Meeting.audio/`，避免原本就是音檔的案例發生不必要複製。
+- 若影片已有同 stem 可用音檔，`transcribe-audio` 應沿用該音檔，不重新抽取。
+- 逐字稿與 metadata 應可輸出到來源目錄旁的 sibling sidecar 目錄。
+- metadata 不應混入後續 `transcript-polish` 會掃描的逐字稿目錄。
 
 ## 2. 現況問題
 
-### 2.1 目錄模式會掃描 `.txt` 與 `.md`
+### 2.1 audio 輸出策略不一致
 
-目前目錄模式掃描指定目錄第一層 `.txt` 與 `.md`。這符合一般文字整理需求，但在整合流程中，轉錄階段可能會產生 `_run-summary.txt`、`_environment.txt`、`_failed-files.txt` 等非正文檔案。
+`extract-audio` 目前固定輸出到來源目錄下的 `audio/` 子目錄；`transcribe-audio` 遇到影片時，抽出的音檔則放回來源目錄同一層。兩者各自合理，但若要做整合 pipeline，必須把 `transcribe-audio` 的 audio policy 明文化並提供參數控制。
 
-目前程式已排除 `_run-summary.txt` 與 `_environment.txt`，但這是列舉式保護，無法涵蓋 `_failed-files.txt` 或未來新增的 control files。整合流程不應依賴每次新增 metadata 檔案時都同步更新下游排除清單。
+本 CR 不要求移除 `extract-audio` 的既有 `audio/` 行為，但建議新增可明確指定輸出策略的參數，降低兩支工具長期歧異。
 
-### 2.2 預設輸出 `formatted/` 會造成階層過深
+### 2.2 逐字稿輸出固定在來源目錄下的 `transcript/`
 
-若上游輸出為：
-
-```text
-Meeting.transcript/
-  a.txt
-  b.txt
-```
-
-目前執行：
-
-```bash
-transcript-polish --dir ./Meeting.transcript
-```
-
-預設會產生：
+現況：
 
 ```text
-Meeting.transcript/
-  formatted/
-    a.md
-    b.md
+Meeting/
+  transcript/
+    xxx.txt
+    _run-summary.txt
+    _environment.txt
+    _failed-files.txt
 ```
 
-這在單工具使用時可以接受，但在整合流程中較不理想。整合流程應產生：
+若再接 `transcript-polish --dir Meeting/transcript`，容易形成：
 
 ```text
-Meeting.transcript/
-Meeting.polished/
-Meeting.meta/
+Meeting/
+  transcript/
+    formatted/
+      xxx.md
 ```
 
-### 2.3 summary/environment 不應混入 polished output
+這會造成階層過深，也讓正文與控制檔混在一起。
 
-目前 `transcript-polish` 會在輸出目錄寫入 `_run-summary.txt` 與 `_environment.txt`。若輸出目錄本身又是未來某階段的輸入，這些檔案可能被誤掃描。即使目前沒有第三階段，也應把 metadata 邊界定清楚。
+### 2.3 metadata 與正文混雜
 
-## 3. 目標行為
+`_run-summary.txt`、`_environment.txt`、`_failed-files.txt` 屬於執行紀錄，不是逐字稿正文。producer 應避免把這些檔案放入 consumer 的輸入集合，不能只依賴下游工具排除。
 
-### 3.1 整合流程預設 layout
+## 3. 目標目錄結構
 
-當輸入目錄名稱符合 `*.transcript` 時：
-
-```bash
-transcript-polish --dir ./Meeting.transcript
-```
-
-預設應推導為：
+假設來源目錄為：
 
 ```text
-input_dir=./Meeting.transcript
-output_dir=./Meeting.polished
-meta_dir=./Meeting.meta
+Meeting/
+  a.mp4
+  a.m4a
+  b.mp4
 ```
 
-也就是：
+目標預設輸出為：
 
 ```text
+Meeting/
+  a.mp4
+  a.m4a
+  b.mp4
+  b.flac
+
 Meeting.transcript/
   a.txt
   b.txt
 
-Meeting.polished/
-  a.md
-  b.md
-
 Meeting.meta/
-  polish-run-summary.txt
-  polish-environment.txt
-  polish-failed-files.txt
+  transcribe-run-summary.txt
+  transcribe-environment.txt
+  transcribe-failed-files.txt
+  extracted-audio.tsv
 ```
 
-此規則讓整合流程可以直接串接：
+說明：
+
+- `Meeting/` 是 media pool，保留原始影片與音檔；必要時才新增抽出的音檔。
+- `Meeting.transcript/` 只放可供下游整理的逐字稿正文。
+- `Meeting.meta/` 放 summary、environment、failed list、抽音軌 manifest。
+- 不預設建立 `Meeting.audio/`。
+
+## 4. `transcribe-audio` CLI 變更
+
+### 4.1 `--layout legacy|sidecar`
+
+目標預設：`sidecar`。
+
+`sidecar` 模式下：
 
 ```bash
 transcribe-audio ./Meeting
-transcript-polish --dir ./Meeting.transcript
 ```
 
-不需要額外指定 `--output-dir ../Meeting.polished`。
-
-### 3.2 一般使用情境保留
-
-若輸入目錄名稱不是 `*.transcript`，為避免破壞既有習慣，預設仍可維持：
+等價於：
 
 ```bash
-transcript-polish --dir ./transcript
+transcribe-audio ./Meeting \
+  --layout sidecar \
+  --audio-output same-dir \
+  --transcript-output ../Meeting.transcript \
+  --meta-output ../Meeting.meta
 ```
 
-輸出：
+注意：`../Meeting.transcript` 與 `../Meeting.meta` 是根據來源目錄的 parent directory 推導，不是根據 shell current working directory 推導。
 
-```text
-transcript/formatted/
-```
-
-因此建議新增 `--layout auto|legacy|sidecar`：
-
-- `auto`：預設。若輸入目錄 basename 以 `.transcript` 結尾，採 sidecar；否則採 legacy。
-- `legacy`：永遠輸出到來源目錄下的 `formatted/`，除非使用者明確指定 `--output-dir`。
-- `sidecar`：永遠輸出到 sibling polished 目錄，除非使用者明確指定 `--output-dir`。
-
-此設計兼顧整合流程預設值與既有單工具使用者相容性。
-
-## 4. CLI 變更規格
-
-### 4.1 新增 `--layout`
-
-```text
---layout auto|legacy|sidecar
-```
-
-預設：`auto`。
-
-行為：
-
-- `auto`：
-  - `SOURCE.transcript/` -> `SOURCE.polished/`。
-  - 其他目錄 -> `SOURCE/formatted/`。
-- `legacy`：
-  - `SOURCE/` -> `SOURCE/formatted/`。
-- `sidecar`：
-  - `SOURCE/` -> `SOURCE_PARENT/SOURCE_BASENAME.polished/`。
-  - 若 `SOURCE_BASENAME` 以 `.transcript` 結尾，先移除該 suffix，再加 `.polished`。
-
-範例：
-
-```text
-Meeting.transcript -> Meeting.polished
-Meeting.raw-transcript -> Meeting.raw-transcript.polished
-transcript -> transcript.polished
-```
-
-### 4.2 調整 `--output-dir`
-
-既有 `--output-dir` 保留。若使用者明確指定 `--output-dir`，它必須優先於 `--layout` 推導。
-
-範例：
+為相容舊行為，必須保留：
 
 ```bash
-transcript-polish --dir ./Meeting.transcript --output-dir ./custom-output
+transcribe-audio ./Meeting --layout legacy
 ```
 
-此時輸出必須是 `./custom-output`，不應再推導 `Meeting.polished/`。
-
-### 4.3 新增 `--meta-output`
+legacy 模式可維持：
 
 ```text
---meta-output PATH
+Meeting/transcript/
 ```
 
-用途：指定 summary、environment、failed list 等非正文輸出位置。
+若擔心直接改預設造成破壞，可分階段：第一階段新增 `--layout sidecar` 並維持 legacy 預設；第二階段再把 sidecar 改成預設。本 CR 的目標狀態是 sidecar 成為預設。
 
-預設規則：
+### 4.2 `--audio-output same-dir|sidecar|cache|none`
 
-- `layout=sidecar` 或 `layout=auto` 且命中 `*.transcript` 時，預設為 `SOURCE_PARENT/SOURCE_STEM.meta`。
-- `layout=legacy` 時，為相容可繼續寫在 output dir，但建議支援 `--meta-output` 明確移出。
-- 若使用者明確指定 `--meta-output`，必須使用該位置。
+建議語意：
 
-### 4.4 新增 `--no-meta`
+- `same-dir`：預設。抽出的音檔放回來源目錄，並可被後續執行重用。
+- `sidecar`：抽出的音檔放到 `SOURCE.audio/`。這是選配，不作為預設。
+- `cache`：抽出的音檔放到 cache/meta 目錄，例如 `SOURCE.meta/audio/`。
+- `none`：不從影片抽音軌，只處理既有音檔；沒有同名音檔的影片應記錄 skipped/failed reason。
 
-選擇性參數。停用 metadata 檔案輸出。
+### 4.3 `--transcript-output PATH`
 
-此參數可用於臨時處理單檔或測試，但整合流程不建議使用，因為整合 wrapper 需要 summary 追蹤成功、跳過與失敗狀態。
-
-### 4.5 新增 `--include-control-files`
-
-預設目錄模式應跳過 control files。若使用者確定要處理 `_xxx.txt` 或其他控制檔，可用此參數覆蓋。
+明確指定逐字稿輸出目錄。若未指定且 layout 為 sidecar，預設為：
 
 ```text
---include-control-files
+SOURCE_PARENT/SOURCE_BASENAME.transcript
 ```
 
-預設：false。
+### 4.4 `--meta-output PATH`
 
-## 5. 輸入掃描規則
-
-### 5.1 支援副檔名
-
-維持現有：
+明確指定 metadata 輸出目錄。若未指定且 layout 為 sidecar，預設為：
 
 ```text
-.txt
-.md
+SOURCE_PARENT/SOURCE_BASENAME.meta
 ```
 
-### 5.2 預設排除規則
+### 4.5 `--no-meta`
 
-目錄模式預設應排除：
+選擇性參數。停用 metadata 檔案輸出。整合流程不建議使用。
 
-- dotfile：檔名以 `.` 開頭。
-- control file：檔名以 `_` 開頭。
-- 明確控制檔名：
-  - `_run-summary.txt`
-  - `_environment.txt`
-  - `_failed-files.txt`
-  - `transcribe-run-summary.txt`
-  - `transcribe-environment.txt`
-  - `transcribe-failed-files.txt`
-  - `polish-run-summary.txt`
-  - `polish-environment.txt`
-  - `polish-failed-files.txt`
-- 位於輸出目錄內的檔案。
-- 位於 metadata 目錄內的檔案。
+## 5. `extract-audio` CLI 補強
 
-建議實作時以通用規則為主：
-
-```python
-if path.name.startswith("."):
-    return True
-if path.name.startswith("_") and not include_control_files:
-    return True
-if path.name in KNOWN_CONTROL_FILE_NAMES and not include_control_files:
-    return True
-```
-
-此規則比只列 `_run-summary.txt` 與 `_environment.txt` 更穩定，也能涵蓋上游目前的 `_failed-files.txt`。
-
-### 5.3 單檔模式
-
-`--file` 模式若使用者明確指定 `_xxx.txt`，可以允許處理，因為這是顯式意圖。若要更保守，可在處理前顯示 warning，但不應直接拒絕。
-
-此差異很重要：
-
-- 目錄模式：保護使用者，避免誤處理控制檔。
-- 單檔模式：尊重使用者明確指定。
-
-## 6. 輸出路徑推導規則
-
-### 6.1 `*.transcript` 推導
-
-輸入：
+`extract-audio` 可保留目前 `SOURCE/audio/` 預設，但建議新增：
 
 ```text
-/mnt/d/Videos/Meeting.transcript
+--output-dir PATH
+--output-mode child|same-dir|sidecar
 ```
 
-推導：
+建議語意：
 
-```text
-base_name=Meeting
-output_dir=/mnt/d/Videos/Meeting.polished
-meta_dir=/mnt/d/Videos/Meeting.meta
-```
+- `child`：現行行為，輸出到 `SOURCE/audio/`。
+- `same-dir`：輸出到來源目錄同一層。
+- `sidecar`：輸出到 `SOURCE_PARENT/SOURCE_BASENAME.audio/`。
+- `--output-dir` 明確指定時，優先於 `--output-mode`。
 
-### 6.2 非 `*.transcript` 的 sidecar 推導
+這不是整合流程的硬性必要條件，但可讓兩支工具長期維持一致的路徑語意。
 
-輸入：
+## 6. 同名音檔重用規則
 
-```text
-/mnt/d/Videos/RawText
-```
+`transcribe-audio` 應先掃描來源目錄第一層音檔，建立 stem 對應。遇到影片時：
 
-在 `--layout sidecar` 下推導：
+1. 取影片 stem。
+2. 若已有同 stem 可用音檔，且未指定 `--force`，沿用既有音檔。
+3. 若沒有同 stem 音檔，依 `--audio-output` 決定是否抽音軌。
+4. 若直接抽取失敗，可 fallback 成 FLAC。
+5. 所有 reuse/extract/failed/skipped 狀態都應寫入 `extracted-audio.tsv`。
 
-```text
-output_dir=/mnt/d/Videos/RawText.polished
-meta_dir=/mnt/d/Videos/RawText.meta
-```
-
-### 6.3 防呆規則
-
-必須報錯的情況：
-
-- `output_dir` 等於 `input_dir`。
-- `meta_dir` 等於 `input_dir`。
-- `meta_dir` 等於 `output_dir`，除非使用者指定 legacy 相容模式且文件明確允許。
-- `output_dir` 位於 `input_dir` 內，而 layout 為 sidecar。
-- `input_dir` 位於 `output_dir` 內。
-
-legacy 模式可暫時允許 `input_dir/formatted`，但 sidecar 模式不應產生巢狀輸出。
+此規則的目的，是支援使用者把 video 與 audio 都放在 `Meeting/`，而不是強迫先搬移或複製音檔。
 
 ## 7. Metadata 規格
 
-### 7.1 sidecar layout 下的 metadata 檔名
-
-sidecar layout 應使用工具前綴命名：
+sidecar layout 下 metadata 檔名應使用工具前綴：
 
 ```text
-polish-run-summary.txt
-polish-environment.txt
-polish-failed-files.txt
+transcribe-run-summary.txt
+transcribe-environment.txt
+transcribe-failed-files.txt
+extracted-audio.tsv
 ```
 
-不建議在 sidecar layout 使用 `_run-summary.txt` 與 `_environment.txt`，因為 `_` 命名原本是為了降低在同目錄被掃描的風險；當 metadata 已移到 `Meeting.meta/` 後，應使用語意清楚的檔名。
-
-### 7.2 legacy layout 相容
-
-legacy layout 可保留：
+`extracted-audio.tsv` 格式：
 
 ```text
-formatted/_run-summary.txt
-formatted/_environment.txt
+video_file	audio_file	codec	status	reason
+a.mp4	a.m4a	aac	reused_existing_audio	
+b.mp4	b.flac	flac	extracted	
+c.mp4			no_audio_stream	no audio stream found
 ```
 
-但若使用者提供 `--meta-output`，應改寫到指定 metadata 目錄。
-
-### 7.3 failed list
-
-目前處理失敗只在 stdout 顯示。建議新增 failed list：
+建議狀態值：
 
 ```text
-polish-failed-files.txt
+reused_existing_audio
+extracted
+converted_to_flac
+no_audio_stream
+extract_failed
+skipped_by_audio_output_none
 ```
 
-格式：
+## 8. 與 transcript-polish 的整合契約
+
+`transcribe-audio` 在 sidecar layout 下必須保證：
+
+- `TRANSCRIPT_DIR` 只放正文逐字稿，預設為 `.txt`。
+- metadata 不放入 `TRANSCRIPT_DIR`。
+- 完成時 stdout 末尾輸出可解析的結果資訊。
+
+建議 stdout 末尾：
 
 ```text
-input_file	output_file	reason
-bad.txt	bad.md	model_output_too_short
+[result] transcript_dir=/mnt/d/Videos/Meeting.transcript
+[result] meta_dir=/mnt/d/Videos/Meeting.meta
+[result] audio_policy=same-dir
 ```
 
-此檔案供整合 wrapper 判斷與報告，不應進入 `Meeting.polished/`。
-
-## 8. 與 transcribe-audio 的整合契約
-
-`transcript-polish` 應能直接消費以下結構：
-
-```text
-Meeting.transcript/
-  a.txt
-  b.txt
-
-Meeting.meta/
-  transcribe-run-summary.txt
-  transcribe-environment.txt
-  extracted-audio.tsv
-```
-
-執行：
+未來整合 wrapper 可讀取這些資訊，再呼叫：
 
 ```bash
-transcript-polish --dir ./Meeting.transcript
+transcript-polish --dir /mnt/d/Videos/Meeting.transcript \
+  --output-dir /mnt/d/Videos/Meeting.polished \
+  --meta-output /mnt/d/Videos/Meeting.meta
 ```
 
-預期產生：
+## 9. 路徑防呆規則
 
-```text
-Meeting.polished/
-  a.md
-  b.md
+必須報錯的情況：
 
-Meeting.meta/
-  transcribe-run-summary.txt
-  transcribe-environment.txt
-  extracted-audio.tsv
-  polish-run-summary.txt
-  polish-environment.txt
-  polish-failed-files.txt
-```
-
-注意：`transcript-polish` 不需要讀取 `Meeting.meta/` 才能工作；`Meeting.meta/` 是整合流程的觀測與追蹤輸出位置。
-
-完成時建議 stdout 末尾加入：
-
-```text
-[result] output_dir=/mnt/d/Videos/Meeting.polished
-[result] meta_dir=/mnt/d/Videos/Meeting.meta
-```
-
-未來整合 wrapper 可以用這些資訊產生總結。
-
-## 9. 模型與 prompt 行為不在本 CR 範圍
-
-本 CR 不改變下列行為：
-
-- conservative polishing 原則。
-- standard / quality mode 對應模型。
-- OpenCC 簡轉繁行為。
-- repair pass 判斷邏輯。
-- prompt config、style guide、replace dict 的語意。
-
-除非輸入掃描與輸出路徑需要，否則不應動到模型推論核心。
+- 來源目錄不存在。
+- sidecar 推導結果等於來源目錄。
+- `--transcript-output` 等於來源目錄。
+- `--meta-output` 等於來源目錄。
+- `--transcript-output` 等於 `--meta-output`。
+- 來源目錄是 filesystem root，無法安全推導 sidecar，除非使用者明確指定輸出目錄。
 
 ## 10. 測試案例
 
-### 10.1 整合流程基本案例
+### 10.1 同名音檔已存在
 
 輸入：
 
 ```text
-Meeting.transcript/
-  a.txt
-  b.txt
+Meeting/
+  a.mp4
+  a.m4a
 ```
 
 執行：
 
 ```bash
-transcript-polish --dir ./Meeting.transcript
+transcribe-audio ./Meeting --layout sidecar
 ```
 
 預期：
 
-```text
-Meeting.polished/
-  a.md
-  b.md
+- 不重新抽音軌。
+- 使用 `a.m4a` 轉錄。
+- 產生 `Meeting.transcript/a.txt`。
+- `Meeting.meta/extracted-audio.tsv` 記錄 `reused_existing_audio`。
 
-Meeting.meta/
-  polish-run-summary.txt
-  polish-environment.txt
-```
-
-且不得產生：
-
-```text
-Meeting.transcript/formatted/
-```
-
-### 10.2 排除上游 metadata
+### 10.2 影片無同名音檔
 
 輸入：
 
 ```text
-Meeting.transcript/
-  a.txt
-  _run-summary.txt
-  _environment.txt
-  _failed-files.txt
-```
-
-執行：
-
-```bash
-transcript-polish --dir ./Meeting.transcript
+Meeting/
+  b.mp4
 ```
 
 預期：
 
-- 只處理 `a.txt`。
-- 不處理任何 `_*.txt`。
-- summary 中 `files_found` 應只計算實際可處理正文，或另行記錄 `files_ignored`。
+- 抽出 `Meeting/b.<ext>`。
+- 產生 `Meeting.transcript/b.txt`。
+- metadata 放在 `Meeting.meta/`。
+- `Meeting.transcript/` 不得有 `_run-summary.txt`、`_environment.txt`、`_failed-files.txt`。
 
-### 10.3 一般 legacy 使用
-
-輸入：
-
-```text
-transcript/
-  a.txt
-```
+### 10.3 legacy layout
 
 執行：
 
 ```bash
-transcript-polish --dir ./transcript
-```
-
-若 `--layout auto` 且目錄名不是 `*.transcript`，預期保留：
-
-```text
-transcript/formatted/a.md
-```
-
-### 10.4 強制 sidecar
-
-輸入：
-
-```text
-transcript/
-  a.txt
-```
-
-執行：
-
-```bash
-transcript-polish --dir ./transcript --layout sidecar
+transcribe-audio ./Meeting --layout legacy
 ```
 
 預期：
 
-```text
-transcript.polished/a.md
-transcript.meta/polish-run-summary.txt
-```
+- 保留舊輸出 `Meeting/transcript/`。
+- 舊 metadata 命名可暫時保留。
+- 下游工具仍應有自己的 `_*.txt` 排除保護。
 
-### 10.5 明確指定 output 與 meta
+### 10.4 明確指定輸出目錄
 
 執行：
 
 ```bash
-transcript-polish --dir ./Meeting.transcript \
-  --output-dir /tmp/polished \
-  --meta-output /tmp/meta
+transcribe-audio ./Meeting \
+  --transcript-output /tmp/out/transcript \
+  --meta-output /tmp/out/meta
 ```
 
 預期：
 
-- 輸出 markdown 至 `/tmp/polished`。
-- 寫入 metadata 至 `/tmp/meta`。
-- 不再自動產生 `Meeting.polished/` 或 `Meeting.meta/`。
+- 使用指定目錄。
+- 指定目錄不存在時自動建立。
+- 指定目錄與來源目錄相同時報錯。
 
 ## 11. 實作順序建議
 
-1. 將 input discovery 的排除規則從列舉 `_run-summary.txt`、`_environment.txt` 改為通用 control file skip。
-2. 新增 `--include-control-files`，讓使用者可顯式覆蓋目錄模式排除。
-3. 新增 `--layout auto|legacy|sidecar`，先實作 output dir 推導，不動模型流程。
-4. 新增 `--meta-output` 與 sidecar metadata 檔名。
-5. 新增 failed list 輸出。
-6. 更新 README、INSTALL 與 SDD 文件中的目錄範例。
-7. 新增 path resolution 與 input discovery 單元測試。
+1. 抽出 path resolution 函式，集中處理 source parent、basename、sidecar 推導。
+2. 新增 `--layout`、`--transcript-output`、`--meta-output`。
+3. 將 sidecar layout 下的 summary/environment/failed files 移到 meta dir。
+4. 新增 `extracted-audio.tsv`。
+5. 新增 `--audio-output`。
+6. 補 README、INSTALL、既有 SDD 中的目錄範例。
+7. 視相容性策略決定何時把 sidecar 設為預設。
 
 ## 12. 驗收標準
 
-本 CR 完成後，以下兩個指令應可自然串接：
+完成後，以下指令應可作為合併前的穩定 producer contract：
 
 ```bash
 transcribe-audio ./Meeting
-transcript-polish --dir ./Meeting.transcript
 ```
 
-目標輸出：
+目標預設輸出：
 
 ```text
 Meeting/
 Meeting.transcript/
-Meeting.polished/
 Meeting.meta/
 ```
 
 並且：
 
-- `Meeting.transcript/` 中的 `_*.txt` 不會被目錄模式處理。
-- `Meeting.polished/` 只包含潤稿後 Markdown 正文。
-- `Meeting.meta/` 包含上游與本工具的 summary、environment、failed list。
-- 一般 `transcript-polish --dir ./transcript` 仍可保留既有 `formatted/` 行為。
-- 使用者可用 `--layout sidecar` 強制 sidecar，也可用 `--layout legacy` 強制舊行為。
+- `Meeting.transcript/` 僅包含可供文字整理的逐字稿正文。
+- `Meeting.meta/` 包含轉錄摘要、環境資訊、失敗清單與抽音軌 manifest。
+- 來源目錄中的同名音檔會被重用，不會無條件複製到 `Meeting.audio/`。
+- 使用者仍可透過 `--layout legacy` 回到舊版輸出結構。
