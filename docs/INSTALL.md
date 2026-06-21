@@ -39,15 +39,49 @@ cd extract-audio
 cd ~/extract-audio
 ```
 
-## 3. 直接執行
+## 3. 使用 install.sh 安裝 CLI
 
-先給執行權限：
+預設安裝到：
 
-```bash
-chmod +x ./bin/extract-audio
+```text
+~/bin/extract-audio
 ```
 
-直接使用：
+執行：
+
+```bash
+bash install.sh
+```
+
+檢查安裝與依賴：
+
+```bash
+bash install.sh --check
+```
+
+指定安裝目錄：
+
+```bash
+bash install.sh --bin-dir "$HOME/.local/bin"
+```
+
+指定 prefix，會安裝到 `PREFIX/bin`：
+
+```bash
+sudo bash install.sh --prefix /usr/local
+```
+
+移除全域指令：
+
+```bash
+bash install.sh --uninstall
+```
+
+`install.sh` 不會自動修改 shell 設定檔。若安裝目錄不在 PATH，腳本會提示應加入的 `export PATH=...`。
+
+## 4. 直接執行
+
+不安裝也可以直接執行 repo 內腳本：
 
 ```bash
 ./bin/extract-audio
@@ -55,9 +89,9 @@ chmod +x ./bin/extract-audio
 ./bin/extract-audio --force "/mnt/d/Videos/Meeting"
 ```
 
-## 4. 安裝成全域指令
+## 5. 手動安裝成全域指令
 
-建立個人 `bin` 目錄並複製腳本：
+若不使用 `install.sh`，也可以手動複製：
 
 ```bash
 mkdir -p ~/bin
@@ -85,17 +119,16 @@ which extract-audio
 extract-audio --help
 ```
 
-## 5. 更新安裝
+## 6. 更新安裝
 
 若腳本有新版本：
 
 ```bash
-cd ~/extract-audio
-cp ./bin/extract-audio ~/bin/extract-audio
-chmod +x ~/bin/extract-audio
+git pull
+bash install.sh
 ```
 
-## 6. 驗證
+## 7. 驗證
 
 最小驗證：
 
@@ -115,12 +148,12 @@ extract-audio "/mnt/d/Videos/Meeting"
 Meeting/audio/
 ```
 
-## 7. 移除
+## 8. 移除
 
 只移除全域指令：
 
 ```bash
-rm -f ~/bin/extract-audio
+bash install.sh --uninstall
 ```
 
 移除專案目錄：
